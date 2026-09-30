@@ -92,18 +92,14 @@ class DecoderConfigTest(unittest.TestCase):
         original['layers'][FIRST] = 'winograd_3d'
         self.assertEqual(self.model.decoder_conv_plan()[FIRST], 'winograd_2d')
 
-    def test_unimplemented_backends_fail_before_decode_or_cache_mutation(self):
-        self.model.clear_cache()
-        cache = self.model._feat_map
-        for backend in ['winograd_3d']:
-            self.model.configure_decoder_convolutions(config({FIRST: backend}))
-            with self.subTest(backend=backend), self.assertRaisesRegex(NotImplementedError, backend):
-                self.model.decode(torch.empty(1, 48, 1, 2, 2, device='meta'), [0, 1])
-            self.assertIs(self.model._feat_map, cache)
-            self.assertTrue(all(x is None for x in cache))
-            layer = dict(self.model.named_modules())[FIRST]
-            with self.assertRaisesRegex(NotImplementedError, backend):
-                layer(torch.empty(1, layer.in_channels, 1, 2, 2, device='meta'))
+    def test_spatial_full_and_mixed_decode_preserve_meta_shapes(self):
+        for modes in [('winograd_2d', 'winograd_2d'),
+                      ('winograd_3d', 'winograd_3d'),
+                      ('winograd_2d', 'winograd_3d')]:
+            self.model.configure_decoder_convolutions(config(dict(zip((FIRST, SECOND), modes))))
+            with self.subTest(modes=modes), torch.no_grad():
+                output = self.model.decode(torch.empty(1, 48, 3, 2, 3, device='meta'), [0, 1])
+                self.assertEqual(tuple(output.shape), (1, 3, 9, 32, 48))
 
     def test_example_configs_resolve(self):
         for path in sorted((ROOT / 'configs/vae_conv').glob('*.json')):

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .winograd_conv import spatial_winograd_conv3d
+from .winograd_3d_conv import full_winograd_conv3d
 
 __all__ = [
     "Wan2_2_VAE",
@@ -34,7 +35,7 @@ def load_conv_config(config=None):
 
     Layer names are exact paths relative to WanVAE_, starting with ``decoder.``.
     winograd_2d means spatial transforms within the original 3D convolution;
-    winograd_3d also transforms the time axis (not implemented yet).
+    winograd_3d also transforms the time axis.
     """
     if config is None:
         return dict(schema_version=1, enabled=False, layers={})
@@ -61,12 +62,8 @@ def load_conv_config(config=None):
 
 
 def _require_conv_backend(backend, layer_name):
-    if backend in ('native', 'winograd_2d'):
+    if backend in CONV_BACKENDS:
         return
-    if backend == 'winograd_3d':
-        raise NotImplementedError(
-            f'{layer_name}: {backend} is configured, but its kernel is not implemented. '
-            'Use enabled=false or native; no native fallback was executed.')
     raise ValueError(f'Unknown convolution backend: {backend!r}')
 
 
@@ -92,8 +89,8 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
-        if self._conv_backend == 'winograd_2d' and self.training:
-            raise RuntimeError('winograd_2d is inference-only; call eval() before using it.')
+        if self._conv_backend in ('winograd_2d', 'winograd_3d') and self.training:
+            raise RuntimeError(f'{self._conv_backend} is inference-only; call eval() before using it.')
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -103,11 +100,13 @@ class CausalConv3d(nn.Conv3d):
 
         if self._conv_backend != 'native':
             _require_conv_backend(self._conv_backend, self._conv_layer_name)
-            if self._conv_backend == 'winograd_2d':
+            if self._conv_backend in ('winograd_2d', 'winograd_3d'):
                 if not (self.kernel_size == (3, 3, 3) and self.stride == (1, 1, 1)
                         and self.dilation == (1, 1, 1) and self.groups == 1):
-                    raise ValueError('Unsupported convolution parameters for winograd_2d.')
-                result, self._winograd_weight_cache = spatial_winograd_conv3d(
+                    raise ValueError(f'Unsupported convolution parameters for {self._conv_backend}.')
+                compute = (spatial_winograd_conv3d if self._conv_backend == 'winograd_2d'
+                           else full_winograd_conv3d)
+                result, self._winograd_weight_cache = compute(
                     x, self.weight, self.bias, cache=self._winograd_weight_cache)
                 return result
         return super().forward(x)

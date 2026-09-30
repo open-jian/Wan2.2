@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import random
 import socket
 import statistics
@@ -46,8 +47,8 @@ def paired_timings(functions, repeats):
     medians = {k: statistics.median(v) for k, v in values.items()}
     return dict(samples_ms=values, median_ms=medians,
                 peak_extra_allocated_bytes={k: max(v) for k, v in peak_extra.items()},
-                speedup=medians['native']/medians['winograd_2d'],
-                latency_reduction_percent=100*(1-medians['winograd_2d']/medians['native']))
+                speedup=medians['native']/medians['candidate'],
+                latency_reduction_percent=100*(1-medians['candidate']/medians['native']))
 
 
 def main():
@@ -60,19 +61,27 @@ def main():
     parser.add_argument('--conv-config', type=Path, default=Path('configs/vae_conv/winograd_2d.json'))
     parser.add_argument('--weight-dtype', choices=['float32', 'bfloat16'], default='float32')
     parser.add_argument('--channels-last', action='store_true')
+    parser.add_argument('--layer-backend', choices=['winograd_2d', 'winograd_3d'], default='winograd_2d')
+    parser.add_argument('--layer-names', nargs='+', default=[
+        'decoder.middle.0.residual.2', 'decoder.upsamples.1.upsamples.0.residual.2',
+        'decoder.upsamples.2.upsamples.0.residual.2',
+        'decoder.upsamples.2.upsamples.0.residual.6',
+        'decoder.upsamples.3.upsamples.1.residual.2'])
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     module = load_vae_module()
     bank = torch.load(args.bank, map_location='cpu', weights_only=True, mmap=True)
     config = module.load_conv_config(args.conv_config)
     report = dict(hostname=socket.gethostname(), gpu=torch.cuda.get_device_name(),
+                  cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                   torch=torch.__version__, cuda_build=torch.version.cuda,
-                  cudnn=torch.backends.cudnn.version(), conv_config=config,
+                  cudnn=torch.backends.cudnn.version(), conv_config=config, layer_backend=args.layer_backend,
                   bank_sha256=hashlib.sha256(args.bank.read_bytes()).hexdigest(),
                   precision=f'{args.weight_dtype} weights, BF16 autocast, eager, no compile or pruning',
                   channels_last_3d_weights=args.channels_last,
                   source_sha256={n: hashlib.sha256((root/'wan/modules'/n).read_bytes()).hexdigest()
-                                 for n in ['vae2_2.py', 'winograd_conv.py', 'winograd_triton.py']},
+                                 for n in ['vae2_2.py', 'winograd_conv.py', 'winograd_triton.py',
+                                           'winograd_3d_conv.py', 'winograd_3d_triton.py']},
                   layers=[], videos=[], checks={})
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -99,9 +108,7 @@ def main():
     modules = dict(native.model.named_modules())
     with torch.inference_mode():
         if args.stage in ('layers', 'all'):
-            names = ['decoder.upsamples.2.upsamples.0.residual.2',
-                     'decoder.upsamples.2.upsamples.0.residual.6',
-                     'decoder.upsamples.3.upsamples.1.residual.2']
+            names = args.layer_names
             records, counts, handles = {}, {}, []
             def capture(name):
                 def hook(layer, inputs):
@@ -122,7 +129,7 @@ def main():
                         layer._conv_backend = 'native'
                         return layer(*inputs)
                     def accelerated():
-                        layer._conv_backend = 'winograd_2d'
+                        layer._conv_backend = args.layer_backend
                         return layer(*inputs)
                     expected = direct()
                     layer._winograd_weight_cache = None
@@ -136,7 +143,7 @@ def main():
                     for _ in range(3):
                         direct()
                         accelerated()
-                    timing = paired_timings({'native': direct, 'winograd_2d': accelerated}, args.repeats)
+                    timing = paired_timings({'native': direct, 'candidate': accelerated}, args.repeats)
                     row = dict(layer=name, chunk=chunk_index, input_shape=list(inputs[0].shape),
                                cache_frames=0 if inputs[1] is None else inputs[1].shape[2],
                                error=error, cold_ms_including_weight_transform_and_jit=cold_ms, **timing)
@@ -167,7 +174,7 @@ def main():
                     native.decode([z])
                     candidate.decode([z])
                     row.update(paired_timings({'native': lambda: native.decode([z]),
-                                              'winograd_2d': lambda: candidate.decode([z])}, args.repeats))
+                                              'candidate': lambda: candidate.decode([z])}, args.repeats))
                 report['videos'].append(row)
                 print(json.dumps(row), flush=True)
                 if i == 0:
@@ -190,7 +197,7 @@ def main():
             evaluated = [row for row in report['videos'] if row['role'] == 'evaluation']
             report['evaluation_summary'] = dict(
                 mean_native_ms=statistics.mean(row['median_ms']['native'] for row in evaluated),
-                mean_winograd_ms=statistics.mean(row['median_ms']['winograd_2d'] for row in evaluated),
+                mean_winograd_ms=statistics.mean(row['median_ms']['candidate'] for row in evaluated),
                 mean_psnr_delta_db=statistics.mean(row['psnr_delta_db'] for row in evaluated))
             summary = report['evaluation_summary']
             summary['speedup'] = summary['mean_native_ms']/summary['mean_winograd_ms']

@@ -54,33 +54,20 @@ def main():
         assert torch.equal(current.decode([latent])[0], expected)
         checks['disabled_mixed_bitwise_equal'] = True
 
-        # A configured but unavailable backend must fail before executing conv1.
-        calls = []
-        handle = current.model.decoder.conv1.register_forward_pre_hook(
-            lambda layer, inputs: calls.append(True))
-        errors = {}
-        for backend in ['winograd_3d']:
-            current.configure_decoder_convolutions(root / f'configs/vae_conv/{backend}.json')
-            current.model.clear_cache()
-            cache = current.model._feat_map
-            try:
-                current.decode([latent])
-            except NotImplementedError as exc:
-                assert backend in str(exc)
-                errors[backend] = str(exc)
-            else:
-                raise AssertionError(f'{backend} silently executed another backend')
-            assert not calls and current.model._feat_map is cache
-        handle.remove()
-        checks['unimplemented_fail_before_convolution_and_cache_mutation'] = True
+        for preset in ['winograd_2d', 'winograd_3d', 'mixed']:
+            current.configure_decoder_convolutions(root / f'configs/vae_conv/{preset}.json')
+            accelerated = current.decode([latent])[0]
+            assert accelerated.shape == expected.shape and accelerated.isfinite().all()
+            assert torch.equal(accelerated, current.decode([latent])[0])
+            checks[f'{preset}_executes_and_repeats'] = True
         assert torch.equal(current.encode([video])[0], reference.encode([video])[0])
         checks['encoder_bitwise_equal_with_decoder_winograd_selected'] = True
         current.configure_decoder_convolutions(None)
         assert torch.equal(current.decode([latent])[0], expected)
-        checks['restore_native_after_failure_bitwise_equal'] = True
+        checks['restore_native_after_winograd_bitwise_equal'] = True
     torch.cuda.synchronize()
     report = dict(
-        scope='Native compatibility/configuration test only; spatial Winograd tested separately.',
+        scope='Native compatibility/configuration test only; Winograd quality and speed tested separately.',
         hostname=socket.gethostname(), gpu=torch.cuda.get_device_name(0),
         torch=torch.__version__, cuda_build=torch.version.cuda,
         cudnn=torch.backends.cudnn.version(), reference_commit=reference_commit,
@@ -88,7 +75,7 @@ def main():
         current_source_sha256=hashlib.sha256(current_source).hexdigest(),
         latent_shape=list(latent.shape), rgb_shape=list(expected.shape),
         weight_dtype='float32', autocast_dtype='bfloat16', checks=checks,
-        expected_errors=errors)
+        configured_backends=['native', 'winograd_2d', 'winograd_3d'])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))

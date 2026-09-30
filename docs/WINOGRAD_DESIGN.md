@@ -2,7 +2,9 @@
 
 日期：2026-09-30。分支：`winograd`。基线提交：`1ea34ff48f87168174e12956e200b1c5ff`。
 
-2026-09-30 实现更新：`winograd_2d` 已接入空间F(2×2,3×3)，包括PyTorch参考路径和CUDA FP16/BF16 Triton输入变换/矩阵乘法/输出还原，保留完整时间切片。配置和数学/缓存/CUDA合计17项测试通过。erebus最终4段81帧240×320对照：原精度基线1179.043→783.823ms，1.5042倍、耗时降33.52%、平均PSNR变化+0.000868dB；相对BF16+channels-last基线另有1.3865倍、耗时降27.88%。28层变换权重缓存额外1746MiB。逐段1.495—1.513倍，尚不能称稳定全面超过1.5。详情归档到主项目 `results/20260930_winograd_impl/RESULTS.md`。`winograd_3d`仍未实现。使用和限制见 `configs/vae_conv/README.md`。
+2026-09-30 实现更新：`winograd_2d` 已接入空间F(2×2,3×3)，包括PyTorch参考路径和CUDA FP16/BF16 Triton输入变换/矩阵乘法/输出还原，保留完整时间切片。配置和数学/缓存/CUDA合计17项测试通过。erebus最终4段81帧240×320对照：原精度基线1179.043→783.823ms，1.5042倍、耗时降33.52%、平均PSNR变化+0.000868dB；相对BF16+channels-last基线另有1.3865倍、耗时降27.88%。28层变换权重缓存额外1746MiB。逐段1.495—1.513倍，尚不能称稳定全面超过1.5。详情归档到主项目 `results/20260930_winograd_impl/RESULTS.md`。`winograd_3d`在后续本轮已实现，见下段。使用和限制见 `configs/vae_conv/README.md`。
+
+2026-09-30 三维实现更新：新增`winograd_3d_conv.py`和`winograd_3d_triton.py`，实现F(2×2×2,3×3×3)，64个变换域矩阵乘法。所有三轴都变换，没有二维/原生回退；时间边界按调用内补零裁切，保留原历史缓存。新增全部三维和按时间形状混合的配置；26项检查及真实视频因果/重建验证通过；原精度基线1.6176倍、耗时降38.18%，相对BF16＋channels-last基线另有1.4895倍。摘要见[WINOGRAD_3D.md](WINOGRAD_3D.md)，原始结果见主项目`results/20260930_winograd_3d/RESULTS.md`。
 
 以下结构和行号分析以页首 Git 基线为准；当前源码已增加配置代码，行号有变化。`docs/winograd_decoder_inventory.json` 保留接入前结构审计，更新后的 native 形状检查与兼容性证据在主项目 `results/20260930_conv_config/`。
 
@@ -64,12 +66,12 @@ WanTI2V：wan/textimage2video.py
 
 `wan/modules/vae2_2.py:34` 的 `CausalConv3d.forward` 已经完成历史帧拼接和因果 padding，最后在第 42 行调用 `super().forward(x)`。**在这最后一步增加分支**，两条计算路径共用前面的缓存与补边。
 
-当前空间版已接在这个位置，调用独立的Winograd计算函数并更新非持久权重缓存；三维版仍抛出 `NotImplementedError`。以下为简化示意：
+当前空间版和三维版均接在这个位置，调用各自的Winograd计算函数并更新非持久权重缓存。以下为简化示意：
 
 ```python
 # x 已经过原来的历史帧拼接与 F.pad
-if self._conv_backend == 'winograd' and supported(self, x):
-    return spatial_winograd_conv3d_valid(x, self.weight, self.bias)
+if self._conv_backend in ('winograd_2d', 'winograd_3d'):
+    return selected_winograd_backend(x, self.weight, self.bias)
 return super().forward(x)
 ```
 
@@ -84,7 +86,7 @@ return super().forward(x)
 | `wan/modules/winograd_triton.py` | 已实现CUDA半精度的输入变换、16组GEMM和逆变换，FP32累加 |
 | `benchmarks/` 下新增验证/测速脚本 | 明确加载本 fork；分别验证单层和完整解码器，对比两条路径 |
 
-启用函数检查完整层名，列出实际启用的层；不存在的层名或非目标 kernel/stride/dilation/groups 直接报错。空间版仅做推理，设备和精度条件见配置README，三维版仍明确报错。空间版没有原卷积回退；不同精度分别走Triton或PyTorch Winograd参考路径，不混称为同一性能实现。
+启用函数检查完整层名，列出实际启用的层；不存在的层名或非目标 kernel/stride/dilation/groups 直接报错。两种后端仅做推理，设备和精度条件见配置README。空间版没有原卷积回退；不同精度分别走Triton或PyTorch Winograd参考路径，不混称为同一性能实现。
 
 ### 必须保留的缓存语义
 

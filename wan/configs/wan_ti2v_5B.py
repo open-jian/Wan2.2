@@ -15,6 +15,7 @@ ti2v_5B.t5_tokenizer = 'google/umt5-xxl'
 # vae
 ti2v_5B.vae_checkpoint = 'Wan2.2_VAE.pth'
 ti2v_5B.vae_stride = (4, 16, 16)
+ti2v_5B.vae_conv_config = None  # Optional path to a configs/vae_conv/*.json file.
 
 # transformer
 ti2v_5B.patch_size = (1, 2, 2)

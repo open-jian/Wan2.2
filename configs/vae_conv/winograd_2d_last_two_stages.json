@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "layers": {
+    "decoder.upsamples.2.upsamples.0.residual.2": "winograd_2d",
+    "decoder.upsamples.2.upsamples.0.residual.6": "winograd_2d",
+    "decoder.upsamples.2.upsamples.1.residual.2": "winograd_2d",
+    "decoder.upsamples.2.upsamples.1.residual.6": "winograd_2d",
+    "decoder.upsamples.2.upsamples.2.residual.2": "winograd_2d",
+    "decoder.upsamples.2.upsamples.2.residual.6": "winograd_2d",
+    "decoder.upsamples.3.upsamples.0.residual.2": "winograd_2d",
+    "decoder.upsamples.3.upsamples.0.residual.6": "winograd_2d",
+    "decoder.upsamples.3.upsamples.1.residual.2": "winograd_2d",
+    "decoder.upsamples.3.upsamples.1.residual.6": "winograd_2d",
+    "decoder.upsamples.3.upsamples.2.residual.2": "winograd_2d",
+    "decoder.upsamples.3.upsamples.2.residual.6": "winograd_2d"
+  }
+}

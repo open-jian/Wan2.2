@@ -1,5 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import json
 import logging
+from pathlib import Path
 
 import torch
 import torch.cuda.amp as amp
@@ -7,11 +9,65 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .winograd_conv import spatial_winograd_conv3d
+
 __all__ = [
     "Wan2_2_VAE",
+    "load_conv_config",
 ]
 
 CACHE_T = 2
+CONV_BACKENDS = ('native', 'winograd_2d', 'winograd_3d')
+
+
+def _unique_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate convolution config key: {key!r}')
+        result[key] = value
+    return result
+
+
+def load_conv_config(config=None):
+    """Load a strict JSON config (or dict); None selects the native decoder.
+
+    Layer names are exact paths relative to WanVAE_, starting with ``decoder.``.
+    winograd_2d means spatial transforms within the original 3D convolution;
+    winograd_3d also transforms the time axis (not implemented yet).
+    """
+    if config is None:
+        return dict(schema_version=1, enabled=False, layers={})
+    if isinstance(config, (str, Path)):
+        with Path(config).open(encoding='utf-8') as stream:
+            config = json.load(stream, object_pairs_hook=_unique_json_keys)
+    if not isinstance(config, dict):
+        raise ValueError('Convolution config must be a JSON object or a JSON file path.')
+    required = {'schema_version', 'enabled', 'layers'}
+    if set(config) != required:
+        raise ValueError(f'Convolution config requires exactly {sorted(required)}.')
+    if type(config['schema_version']) is not int or config['schema_version'] != 1:
+        raise ValueError('Convolution config schema_version must be integer 1.')
+    if type(config['enabled']) is not bool:
+        raise ValueError('Convolution config enabled must be true or false.')
+    if not isinstance(config['layers'], dict):
+        raise ValueError('Convolution config layers must map exact layer names to backends.')
+    for name, backend in config['layers'].items():
+        if not isinstance(name, str) or not name.startswith('decoder.'):
+            raise ValueError(f'Only exact decoder layer paths are allowed: {name!r}')
+        if not isinstance(backend, str) or backend not in CONV_BACKENDS:
+            raise ValueError(f'Unknown backend {backend!r} for {name}; choose {CONV_BACKENDS}.')
+    return dict(schema_version=1, enabled=config['enabled'], layers=dict(config['layers']))
+
+
+def _require_conv_backend(backend, layer_name):
+    if backend in ('native', 'winograd_2d'):
+        return
+    if backend == 'winograd_3d':
+        raise NotImplementedError(
+            f'{layer_name}: {backend} is configured, but its kernel is not implemented. '
+            'Use enabled=false or native; no native fallback was executed.')
+    raise ValueError(f'Unknown convolution backend: {backend!r}')
 
 
 class CausalConv3d(nn.Conv3d):
@@ -21,6 +77,10 @@ class CausalConv3d(nn.Conv3d):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Plain attributes preserve the original checkpoint and module hierarchy.
+        self._conv_backend = 'native'
+        self._conv_layer_name = 'CausalConv3d'
+        self._winograd_weight_cache = None
         self._padding = (
             self.padding[2],
             self.padding[2],
@@ -32,6 +92,8 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
+        if self._conv_backend == 'winograd_2d' and self.training:
+            raise RuntimeError('winograd_2d is inference-only; call eval() before using it.')
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -39,7 +101,24 @@ class CausalConv3d(nn.Conv3d):
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
 
+        if self._conv_backend != 'native':
+            _require_conv_backend(self._conv_backend, self._conv_layer_name)
+            if self._conv_backend == 'winograd_2d':
+                if not (self.kernel_size == (3, 3, 3) and self.stride == (1, 1, 1)
+                        and self.dilation == (1, 1, 1) and self.groups == 1):
+                    raise ValueError('Unsupported convolution parameters for winograd_2d.')
+                result, self._winograd_weight_cache = spatial_winograd_conv3d(
+                    x, self.weight, self.bias, cache=self._winograd_weight_cache)
+                return result
         return super().forward(x)
+
+    def _apply(self, fn, recurse=True):
+        self._winograd_weight_cache = None
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._winograd_weight_cache = None
+        return super()._load_from_state_dict(*args, **kwargs)
 
 
 class RMS_norm(nn.Module):
@@ -774,6 +853,51 @@ class WanVAE_(nn.Module):
             self.temperal_upsample,
             dropout,
         )
+        self._decoder_conv_overrides = {}
+
+    def decoder_conv_plan(self):
+        """Return the effective backend for every causal convolution in the decoder."""
+        return {
+            f'decoder.{name}': layer._conv_backend
+            for name, layer in self.decoder.named_modules()
+            if isinstance(layer, CausalConv3d)
+        }
+
+    def configure_decoder_convolutions(self, config=None):
+        """Replace the decoder plan atomically; unspecified layers use native.
+
+        Configs are validated even when disabled. This method selects backends,
+        but does not claim their kernels are available. Decode checks availability
+        before changing caches or doing any convolution.
+        """
+        config = load_conv_config(config)
+        layers = {
+            f'decoder.{name}': layer
+            for name, layer in self.decoder.named_modules()
+            if isinstance(layer, CausalConv3d)
+        }
+        for name, backend in config['layers'].items():
+            if name not in layers:
+                raise ValueError(f'Unknown decoder CausalConv3d layer: {name}')
+            layer = layers[name]
+            if backend != 'native' and not (
+                    layer.kernel_size == (3, 3, 3)
+                    and layer.stride == (1, 1, 1)
+                    and layer.dilation == (1, 1, 1)
+                    and layer.groups == 1):
+                raise ValueError(
+                    f'{name}: {backend} requires kernel=3x3x3, stride=1, '
+                    'dilation=1 and groups=1.')
+        requested = config['layers'] if config['enabled'] else {}
+        for name, layer in layers.items():
+            layer._winograd_weight_cache = None
+            layer._conv_backend = requested.get(name, 'native')
+            layer._conv_layer_name = name
+        self._decoder_conv_overrides = {
+            name: backend for name, backend in requested.items() if backend != 'native'
+        }
+        logging.info('VAE decoder convolution overrides: %s', self._decoder_conv_overrides)
+        return self.decoder_conv_plan()
 
     def forward(self, x, scale=[0, 1]):
         mu = self.encode(x, scale)
@@ -810,6 +934,8 @@ class WanVAE_(nn.Module):
         return mu
 
     def decode(self, z, scale):
+        for name, backend in self._decoder_conv_overrides.items():
+            _require_conv_backend(backend, name)
         self.clear_cache()
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
@@ -896,8 +1022,10 @@ class Wan2_2_VAE:
         temperal_downsample=[False, True, True],
         dtype=torch.float,
         device="cuda",
+        conv_config=None,
     ):
 
+        conv_config = load_conv_config(conv_config)
         self.dtype = dtype
         self.device = device
 
@@ -1019,7 +1147,13 @@ class Wan2_2_VAE:
                 dim=c_dim,
                 dim_mult=dim_mult,
                 temperal_downsample=temperal_downsample,
-            ).eval().requires_grad_(False).to(device))
+            ).eval().requires_grad_(False))
+        self.configure_decoder_convolutions(conv_config)
+        self.model.to(device)
+
+    def configure_decoder_convolutions(self, config=None):
+        """Load a JSON file/dict, or pass None to restore native decoder execution."""
+        return self.model.configure_decoder_convolutions(config)
 
     def encode(self, videos):
         try:

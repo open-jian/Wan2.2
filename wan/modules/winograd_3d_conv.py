@@ -64,7 +64,7 @@ def _reference_3d(x, u, bias, out, chunk):
 
 
 def full_winograd_conv3d(x, weight, bias=None, cache=None,
-                         workspace_bytes=WORKSPACE_BYTES):
+                         workspace_bytes=WORKSPACE_BYTES, *, fused=False):
     """Return (output, transient cache); no spatial/native fallback is used."""
     if x.ndim != 5 or weight.ndim != 5 or tuple(weight.shape[2:]) != (3, 3, 3):
         raise ValueError('Full Winograd requires NCTHW input and K,C,3,3,3 weights.')
@@ -109,7 +109,11 @@ def full_winograd_conv3d(x, weight, bias=None, cache=None,
             if chunk >= 128:
                 chunk = (chunk // 128) * 128
             with torch.cuda.device(x.device):
-                run_full_winograd(x, u, bias, out, chunk)
+                if fused:
+                    from .winograd_fused_triton import run_fused_winograd
+                    run_fused_winograd(x, u, bias, out, chunk, full_3d=True)
+                else:
+                    run_full_winograd(x, u, bias, out, chunk)
         else:
             _reference_3d(x, u, bias, out, chunk)
     return out, cache

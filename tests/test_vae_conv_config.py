@@ -95,7 +95,8 @@ class DecoderConfigTest(unittest.TestCase):
     def test_spatial_full_and_mixed_decode_preserve_meta_shapes(self):
         for modes in [('winograd_2d', 'winograd_2d'),
                       ('winograd_3d', 'winograd_3d'),
-                      ('winograd_2d', 'winograd_3d')]:
+                      ('winograd_2d', 'winograd_3d'),
+                      ('winograd_2d_fused', 'winograd_3d_fused')]:
             self.model.configure_decoder_convolutions(config(dict(zip((FIRST, SECOND), modes))))
             with self.subTest(modes=modes), torch.no_grad():
                 output = self.model.decode(torch.empty(1, 48, 3, 2, 3, device='meta'), [0, 1])

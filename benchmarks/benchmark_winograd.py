@@ -59,9 +59,12 @@ def main():
     parser.add_argument('--stage', choices=['layers', 'decode', 'all'], default='all')
     parser.add_argument('--repeats', type=int, default=10)
     parser.add_argument('--conv-config', type=Path, default=Path('configs/vae_conv/winograd_2d.json'))
+    parser.add_argument('--comparison-config', type=Path,
+                        help='Optional third decoder, timed in the same randomized sequence.')
     parser.add_argument('--weight-dtype', choices=['float32', 'bfloat16'], default='float32')
     parser.add_argument('--channels-last', action='store_true')
-    parser.add_argument('--layer-backend', choices=['winograd_2d', 'winograd_3d'], default='winograd_2d')
+    parser.add_argument('--layer-backend', choices=['winograd_2d', 'winograd_3d',
+                        'winograd_2d_fused', 'winograd_3d_fused'], default='winograd_2d')
     parser.add_argument('--layer-names', nargs='+', default=[
         'decoder.middle.0.residual.2', 'decoder.upsamples.1.upsamples.0.residual.2',
         'decoder.upsamples.2.upsamples.0.residual.2',
@@ -81,7 +84,8 @@ def main():
                   channels_last_3d_weights=args.channels_last,
                   source_sha256={n: hashlib.sha256((root/'wan/modules'/n).read_bytes()).hexdigest()
                                  for n in ['vae2_2.py', 'winograd_conv.py', 'winograd_triton.py',
-                                           'winograd_3d_conv.py', 'winograd_3d_triton.py']},
+                                           'winograd_3d_conv.py', 'winograd_3d_triton.py',
+                                           'winograd_fused_triton.py']},
                   layers=[], videos=[], checks={})
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -92,11 +96,16 @@ def main():
     # Create parameters outside inference_mode so their version counters can
     # invalidate/reuse transformed weights. Inference tensors are not cacheable.
     candidate = None
+    comparison = None
     if args.stage in ('decode', 'all'):
         candidate = module.Wan2_2_VAE(vae_pth=str(args.checkpoint), device='cuda',
                                       dtype=torch.bfloat16, conv_config=config)
         assert not any(p.is_inference() for p in candidate.model.parameters())
-    for vae in [native, candidate]:
+        if args.comparison_config is not None:
+            report['comparison_config'] = module.load_conv_config(args.comparison_config)
+            comparison = module.Wan2_2_VAE(vae_pth=str(args.checkpoint), device='cuda',
+                                          dtype=torch.bfloat16, conv_config=report['comparison_config'])
+    for vae in [native, candidate, comparison]:
         if vae is None:
             continue
         if args.weight_dtype == 'bfloat16':
@@ -170,11 +179,20 @@ def main():
                            winograd_psnr_db=psnr(actual, x), output_difference=differences(actual, expected),
                            initial_call_wall_ms=first_ms)
                 row['psnr_delta_db'] = row['winograd_psnr_db']-row['native_psnr_db']
+                if comparison is not None:
+                    other = comparison.decode([z])[0]
+                    row['comparison_psnr_db'] = psnr(other, x)
+                    row['candidate_vs_comparison'] = differences(actual, other)
+                    del other
                 if item['role'] == 'evaluation':
                     native.decode([z])
                     candidate.decode([z])
-                    row.update(paired_timings({'native': lambda: native.decode([z]),
-                                              'candidate': lambda: candidate.decode([z])}, args.repeats))
+                    functions = {'native': lambda: native.decode([z]),
+                                 'candidate': lambda: candidate.decode([z])}
+                    if comparison is not None:
+                        comparison.decode([z])
+                        functions['comparison'] = lambda: comparison.decode([z])
+                    row.update(paired_timings(functions, args.repeats))
                 report['videos'].append(row)
                 print(json.dumps(row), flush=True)
                 if i == 0:
@@ -202,6 +220,9 @@ def main():
             summary = report['evaluation_summary']
             summary['speedup'] = summary['mean_native_ms']/summary['mean_winograd_ms']
             summary['latency_reduction_percent'] = 100*(1-summary['mean_winograd_ms']/summary['mean_native_ms'])
+            if comparison is not None:
+                summary['mean_comparison_ms'] = statistics.mean(row['median_ms']['comparison'] for row in evaluated)
+                summary['speedup_vs_comparison'] = summary['mean_comparison_ms']/summary['mean_winograd_ms']
         report['status'] = 'complete'
         save()
 

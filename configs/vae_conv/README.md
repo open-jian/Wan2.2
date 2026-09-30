@@ -4,6 +4,8 @@
 
 三维实现与实测摘要见 [WINOGRAD_3D.md](../../docs/WINOGRAD_3D.md)。
 
+新增实验入口 `winograd_2d_fused` / `winograd_3d_fused`，对应 `_fused_all_residuals.json` 配置。**首轮实测更慢，暂不推荐用于加速。**实现、源码依据和限制见 [WINOGRAD_FUSION.md](../../docs/WINOGRAD_FUSION.md)；原有模式保持不变。
+
 ## 配置格式
 
 ```json
@@ -21,7 +23,7 @@
 - `layers` 按**精确层名**逐个选择；不支持通配符。未列出的层自动使用 `native`，也可以显式写 `native`。
 - `winograd_2d` 表示只对空间高/宽轴做 Winograd，原三维卷积的时间权重和计算仍保留。
 - `winograd_3d` 表示时间/高/宽三轴一起做 Winograd。
-- 当前两种 Winograd 入口只允许 decoder 的 `3×3×3`、stride=1、dilation=1、groups=1 卷积。编码器、latent 投影及非目标算子不可选。
+- 所有 Winograd 入口只允许 decoder 的 `3×3×3`、stride=1、dilation=1、groups=1 卷积。编码器、latent 投影及非目标算子不可选。
 - 错误字段、未知模式、重复 JSON key、拼错层名或不支持的卷积形状会报错。整份配置校验通过后才替换旧配置，失败不会只改一部分层。
 - 每次加载配置都会完整替换上一次选择，不会累计；配置不写入模型权重，复现时同时保存 JSON 和生成的生效层清单。
 

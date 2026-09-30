@@ -1,6 +1,8 @@
 """Numerical and cache contract tests; use CPU unless CUDA is explicitly enabled."""
 
 import os
+import functools
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -188,6 +190,36 @@ class FullWinogradTest(SpatialWinogradTest):
             streamed = torch.cat(outputs, 2)
             # Different temporal tile alignment changes low-precision roundoff.
             self.assertLess(((streamed.float()-full.float()).norm()/full.float().norm()).item(), 0.02)
+
+
+class SpatialFusedWinogradTest(SpatialWinogradTest):
+    backend = 'winograd_2d_fused'
+    compute = staticmethod(functools.partial(winograd, fused=True))
+
+
+class FullFusedWinogradTest(FullWinogradTest):
+    backend = 'winograd_3d_fused'
+    compute = staticmethod(functools.partial(full_winograd, fused=True))
+
+    @unittest.skipUnless(os.environ.get('WAN_TEST_CUDA') == '1', 'GPU tests require explicit opt-in')
+    def test_partial_fusion_edges_chunking_and_optional_bias(self):
+        fused = importlib.import_module(VAE.__package__+'.winograd_fused_triton')
+        for full in (False, True):
+            weights = importlib.import_module(VAE.__package__+('.winograd_3d_conv' if full else '.winograd_conv'))
+            transform = weights._transform_weight_3d if full else weights._transform_weight
+            for dtype in (torch.float16, torch.bfloat16):
+                for bias in (False, True):
+                    with self.subTest(full=full, dtype=dtype, bias=bias), torch.no_grad():
+                        x = torch.randn(2,7,5,7,9,device='cuda',dtype=dtype).to(memory_format=torch.channels_last_3d)
+                        w = torch.randn(5,7,3,3,3,device='cuda',dtype=dtype)*.1
+                        b = torch.randn(5,device='cuda',dtype=dtype)*.1 if bias else None
+                        u = transform(w,dtype,True)
+                        out = torch.empty(2,5,3,5,7,device='cuda',dtype=dtype,
+                                          memory_format=torch.channels_last_3d)
+                        fused.run_fused_winograd(x,u,b,out,17,full_3d=full,fuse_input=False)
+                        expected = F.conv3d(x.float(),w.float(),None if b is None else b.float())
+                        self.assertLess(((out.float()-expected).norm()/expected.norm()).item(),
+                                        .02 if dtype == torch.bfloat16 else .003)
 
 
 if __name__ == '__main__':

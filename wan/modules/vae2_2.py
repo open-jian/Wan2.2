@@ -18,7 +18,8 @@ __all__ = [
 ]
 
 CACHE_T = 2
-CONV_BACKENDS = ('native', 'winograd_2d', 'winograd_3d')
+CONV_BACKENDS = ('native', 'winograd_2d', 'winograd_3d',
+                 'winograd_2d_fused', 'winograd_3d_fused')
 
 
 def _unique_json_keys(pairs):
@@ -89,7 +90,7 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
-        if self._conv_backend in ('winograd_2d', 'winograd_3d') and self.training:
+        if self._conv_backend in CONV_BACKENDS[1:] and self.training:
             raise RuntimeError(f'{self._conv_backend} is inference-only; call eval() before using it.')
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
@@ -100,14 +101,15 @@ class CausalConv3d(nn.Conv3d):
 
         if self._conv_backend != 'native':
             _require_conv_backend(self._conv_backend, self._conv_layer_name)
-            if self._conv_backend in ('winograd_2d', 'winograd_3d'):
+            if self._conv_backend in CONV_BACKENDS[1:]:
                 if not (self.kernel_size == (3, 3, 3) and self.stride == (1, 1, 1)
                         and self.dilation == (1, 1, 1) and self.groups == 1):
                     raise ValueError(f'Unsupported convolution parameters for {self._conv_backend}.')
-                compute = (spatial_winograd_conv3d if self._conv_backend == 'winograd_2d'
+                compute = (spatial_winograd_conv3d if self._conv_backend.startswith('winograd_2d')
                            else full_winograd_conv3d)
                 result, self._winograd_weight_cache = compute(
-                    x, self.weight, self.bias, cache=self._winograd_weight_cache)
+                    x, self.weight, self.bias, cache=self._winograd_weight_cache,
+                    fused=self._conv_backend.endswith('_fused'))
                 return result
         return super().forward(x)
 

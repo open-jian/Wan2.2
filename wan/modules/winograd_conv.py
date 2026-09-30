@@ -72,7 +72,7 @@ def _reference(x, u, bias, out, chunk):
 
 
 def spatial_winograd_conv3d(x, weight, bias=None, cache=None,
-                           workspace_bytes=WORKSPACE_BYTES):
+                           workspace_bytes=WORKSPACE_BYTES, *, fused=False):
     """Return (output, derived_weight_cache); never call native convolution.
 
     x: already padded NCTHW; weight: [K,C,3,3,3]. stride/dilation/groups are
@@ -119,7 +119,11 @@ def spatial_winograd_conv3d(x, weight, bias=None, cache=None,
             if chunk >= 128:
                 chunk = (chunk // 128) * 128
             with torch.cuda.device(x.device):
-                run_spatial_winograd(x, u, bias, out, chunk)
+                if fused:
+                    from .winograd_fused_triton import run_fused_winograd
+                    run_fused_winograd(x, u, bias, out, chunk, full_3d=False)
+                else:
+                    run_spatial_winograd(x, u, bias, out, chunk)
         else:
             _reference(x, u, bias, out, chunk)
     return out, cache
